@@ -1,0 +1,1032 @@
+================================================================================
+  ai-proxy 接入指南 —— 所有引擎、所有语言的插件怎么接
+  作者：AWA　　本插件全由 DSH 开发
+================================================================================
+
+【先理解一件事，后面就都通了】
+
+  这个接口是「引擎无关」的。
+
+  它就是一个普通的 HTTP 服务，说的是 OpenAI 兼容格式。
+  所以「适配某个引擎」不需要为那个引擎改任何东西 ——
+  只要那个引擎的插件「会发 HTTP 请求」，就能接。
+
+  起源引擎 / Unity / 虚幻 / 寒霜 / GMod / FiveM / Minecraft /
+  Godot / CryEngine / GameMaker / 自研引擎 …… 全都一样。
+
+  下面按引擎给了可直接复制的代码。
+  如果你的引擎不在列表里，直接看最后一节「通用 HTTP 契约」。
+
+
+================================================================================
+  接口契约（所有引擎都遵守这个）
+================================================================================
+
+  地址    http://127.0.0.1:8787/v1/chat/completions
+  方法    POST
+  头      Content-Type: application/json
+          Authorization: Bearer <你的令牌>
+          （有些客户端用 x-api-key: <你的令牌>，也支持）
+
+  请求体（OpenAI 兼容）：
+
+      {
+        "model": "deepseek-chat",
+        "messages": [
+          {"role": "system", "content": "你是一个助手"},
+          {"role": "user",   "content": "你好"}
+        ],
+        "max_tokens": 400,
+        "temperature": 0.3,
+        "stream": false
+      }
+
+  响应体：
+
+      {
+        "choices": [
+          {"message": {"role": "assistant", "content": "你好！"}}
+        ],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 5}
+      }
+
+  ★ 取答案就是取  choices[0].message.content
+
+  ★ 让插件解析 JSON 太麻烦？在 system 里明确要求模型只输出 JSON，
+    然后用字符串截取。见下面「解析简化技巧」。
+
+
+================================================================================
+  解析简化技巧（各语言通用）
+================================================================================
+
+  如果那个引擎没有 JSON 库，别硬解析。两个办法：
+
+  办法一：让模型输出极简格式，用字符串切
+
+      在 messages 里加一句：
+          「你的回答必须只有一行，格式：SCORE|REASON
+             SCORE 是 0 到 100 的整数，REASON 不超过 30 字。不要输出别的。」
+
+      然后拿到的 content 直接按 | 切两半就完了。
+      这是最省事、最不容易出错的做法，强烈推荐给引擎受限的插件。
+
+  办法二：只判断关键词
+
+      content 里包含 "YES" 就是通过，包含 "NO" 就是不通过。
+      简单粗暴但够用。
+
+
+================================================================================
+  一、Unity 引擎
+================================================================================
+
+  Unity 游戏最常见的是 BepInEx 和 MelonLoader。
+  两者都是 C#，代码几乎一样。
+
+--------------------------------------------------------------------------------
+  1.1  BepInEx / MelonLoader —— C#（推荐写法，不阻塞主线程）
+--------------------------------------------------------------------------------
+
+  using System;
+  using System.Net.Http;
+  using System.Text;
+  using System.Threading.Tasks;
+
+  public static class AiClient
+  {
+      // 指向你的代理，不是官方地址
+      private const string BaseUrl = "http://127.0.0.1:8787/v1/chat/completions";
+      private const string Token   = "my-token-1";          // 令牌，不是真 Key
+
+      private static readonly HttpClient Http = new HttpClient
+      {
+          Timeout = TimeSpan.FromSeconds(60)
+      };
+
+      /// <summary>问一句，返回纯文本答案。失败返回 null。</summary>
+      public static async Task<string> AskAsync(string system, string user)
+      {
+          // 用极简格式，省掉 JSON 解析
+          var payload =
+              "{\"model\":\"deepseek-chat\"," +
+              "\"messages\":[" +
+                "{\"role\":\"system\",\"content\":" + Json(system + "\n回答必须只有一行，格式：OK|理由") + "}," +
+                "\"role\":\"user\",\"content\":" + Json(user) + "}" +
+              "]," +
+              "\"max_tokens\":200,\"temperature\":0.2}";
+
+          using (var req = new HttpRequestMessage(HttpMethod.Post, BaseUrl))
+          {
+              req.Headers.Add("Authorization", "Bearer " + Token);
+              req.Content = new StringContent(payload, Encoding.UTF8, "application/json");
+
+              using (var resp = await Http.SendAsync(req).ConfigureAwait(false))
+              {
+                  string body = await resp.Content.ReadAsStringAsync().ConfigureAwait(false);
+                  if (!resp.IsSuccessStatusCode)
+                      return null;
+                  return ExtractContent(body);
+              }
+          }
+      }
+
+      /// <summary>把字符串转义成 JSON 字符串字面量。</summary>
+      private static string Json(string s)
+      {
+          if (s == null) return "\"\"";
+          var sb = new StringBuilder("\"");
+          foreach (char c in s)
+          {
+              switch (c)
+              {
+                  case '"':  sb.Append("\\\""); break;
+                  case '\\': sb.Append("\\\\"); break;
+                  case '\n': sb.Append("\\n");  break;
+                  case '\r': sb.Append("\\r");  break;
+                  case '\t': sb.Append("\\t");  break;
+                  default:
+                      if (c < 0x20) sb.Append("\\u").Append(((int)c).ToString("x4"));
+                      else sb.Append(c);
+                      break;
+              }
+          }
+          return sb.Append('"').ToString();
+      }
+
+      /// <summary>从响应里抠出 choices[0].message.content。</summary>
+      private static string ExtractContent(string json)
+      {
+          const string key = "\"content\":";
+          int i = json.IndexOf(key, StringComparison.Ordinal);
+          if (i < 0) return null;
+          i += key.Length;
+          while (i < json.Length && json[i] == ' ') i++;
+          if (i >= json.Length || json[i] != '"') return null;
+          i++;
+
+          var sb = new StringBuilder();
+          while (i < json.Length)
+          {
+              char c = json[i];
+              if (c == '\\' && i + 1 < json.Length)
+              {
+                  char n = json[++i];
+                  switch (n)
+                  {
+                      case 'n': sb.Append('\n'); break;
+                      case 'r': sb.Append('\r'); break;
+                      case 't': sb.Append('\t'); break;
+                      case '"': sb.Append('"');  break;
+                      case '\\': sb.Append('\\'); break;
+                      case 'u':
+                          if (i + 4 < json.Length)
+                          {
+                              sb.Append((char)Convert.ToInt32(json.Substring(i + 1, 4), 16));
+                              i += 4;
+                          }
+                          break;
+                      default: sb.Append(n); break;
+                  }
+              }
+              else if (c == '"') break;
+              else sb.Append(c);
+              i++;
+          }
+          return sb.ToString();
+      }
+  }
+
+  ★ 用法（注意 Unity 里不能直接改游戏对象，要回主线程）：
+
+      // 在插件里
+      Task.Run(async () =>
+      {
+          string answer = await AiClient.AskAsync("你是审核助手", "玩家数据...");
+          if (answer != null)
+          {
+              // 交给主线程处理
+              MainThreadDispatcher.Enqueue(() => { /* 用 answer */ });
+          }
+      });
+
+  ★ 如果是在 Unity 里并且不想引 System.Net.Http，
+    用 UnityWebRequest 也行，但要放在协程里：
+
+      IEnumerator Ask()
+      {
+          var body = "{\"model\":\"deepseek-chat\",...}";
+          var req = new UnityWebRequest("http://127.0.0.1:8787/v1/chat/completions", "POST");
+          req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+          req.downloadHandler = new DownloadHandlerBuffer();
+          req.SetRequestHeader("Content-Type", "application/json");
+          req.SetRequestHeader("Authorization", "Bearer my-token-1");
+          yield return req.SendWebRequest();
+          if (req.result == UnityWebRequest.Result.Success)
+              Debug.Log(req.downloadHandler.text);
+      }
+
+
+================================================================================
+  二、起源引擎（Source Engine）
+================================================================================
+
+  CS:S / CS:GO / TF2 / L4D2 / 半条命2 等。
+  插件框架主要是 SourceMod（SourcePawn）和 VScript（Squirrel）。
+
+--------------------------------------------------------------------------------
+  2.1  SourceMod —— SourcePawn（需要 1.11+ 的 HTTPClient）
+--------------------------------------------------------------------------------
+
+  #include <sourcemod>
+  #include <httpclient>      // SourceMod 1.11+ 自带
+
+  public Plugin myinfo =
+  {
+      name = "AI 审核",
+      author = "AWA",
+      version = "1.0"
+  };
+
+  public void OnPluginStart()
+  {
+      RegConsoleCmd("sm_ai", Cmd_Ai);
+  }
+
+  public Action Cmd_Ai(int client, int args)
+  {
+      HTTPClient hc = new HTTPClient("http://127.0.0.1:8787/v1/chat/completions");
+
+      hc.SetHeader("Content-Type", "application/json");
+      hc.SetHeader("Authorization", "Bearer my-token-1");
+
+      // 用极简格式，省掉 JSON 解析
+      char body[1024];
+      Format(body, sizeof(body),
+          "{\"model\":\"deepseek-chat\",\"messages\":["
+          "{\"role\":\"system\",\"content\":\"回答必须只有一行，格式：YES|理由\"},"
+          "{\"role\":\"user\",\"content\":\"今天天气怎么样\"}"
+          "],\"max_tokens\":100}");
+
+      hc.Post(body, OnAiResponse);
+      return Plugin_Handled;
+  }
+
+  void OnAiResponse(HTTPStatus status, const char[] data, any value, const char[] error)
+  {
+      if (status != HTTPStatus_OK)
+      {
+          PrintToServer("[AI] 请求失败: %s", error);
+          return;
+      }
+
+      // 简单取 content 字段
+      char content[512];
+      if (ExtractJsonString(data, "content", content, sizeof(content)))
+          PrintToServer("[AI] 回答: %s", content);
+  }
+
+  // 简易 JSON 字符串提取（够用就行）
+  bool ExtractJsonString(const char[] json, const char[] key, char[] out, int maxlen)
+  {
+      char needle[64];
+      Format(needle, sizeof(needle), "\"%s\":", key);
+
+      int pos = StrContains(json, needle);
+      if (pos < 0) return false;
+      pos += strlen(needle);
+
+      // 跳过空格
+      while (json[pos] == ' ') pos++;
+      if (json[pos] != '"') return false;
+      pos++;
+
+      int i = 0;
+      while (json[pos] != '"' && json[pos] != '\0' && i < maxlen - 1)
+      {
+          if (json[pos] == '\\' && json[pos + 1] != '\0')
+          {
+              pos++;
+              if (json[pos] == 'n') out[i++] = '\n';
+              else out[i++] = json[pos];
+          }
+          else out[i++] = json[pos];
+          pos++;
+      }
+      out[i] = '\0';
+      return true;
+  }
+
+  ★ 如果你的 SourceMod 是 1.10 或更早，没有 httpclient。
+    那就装 SteamWorks 扩展（nosoop 维护的版本有 HTTP 功能），
+    或者用 System2 扩展发请求。
+
+--------------------------------------------------------------------------------
+  2.2  VScript —— Squirrel
+--------------------------------------------------------------------------------
+
+  // VScript 的 Squirrel 没有内建 HTTP。
+  // CS:GO / CS2 上可以用 Convars + 外部程序；
+  // 更实际的做法是：VScript 把数据写文件，外面一个 Python 脚本读文件、
+  // 调 AI、再把结果写回来。接口部分用下面 Python 那节的代码。
+
+  // 如果确实要在引擎内发请求，用 Lua 版的思路（见 2.3）。
+
+--------------------------------------------------------------------------------
+  2.3  Lua（部分起源引擎游戏支持 Lua 插件）
+--------------------------------------------------------------------------------
+
+  -- 需要 luasocket 或类似库
+  local http = require("socket.http")
+  local ltn12 = require("ltn12")
+
+  local function ask_ai(user_text)
+      local req_body = string.format(
+          '{"model":"deepseek-chat","messages":[' ..
+          '{"role":"system","content":"回答必须只有一行，格式：YES|理由"},' ..
+          '{"role":"user","content":"%s"}],"max_tokens":100}', user_text)
+
+      local resp = {}
+      local ok, code = http.request{
+          url = "http://127.0.0.1:8787/v1/chat/completions",
+          method = "POST",
+          headers = {
+              ["Content-Type"]  = "application/json",
+              ["Authorization"] = "Bearer my-token-1",
+              ["Content-Length"] = tostring(#req_body),
+          },
+          source = ltn12.source.string(req_body),
+          sink   = ltn12.sink.table(resp),
+      }
+
+      if not ok then return nil, "请求失败" end
+      return table.concat(resp)
+  end
+
+
+================================================================================
+  三、虚幻引擎（Unreal Engine）
+================================================================================
+
+--------------------------------------------------------------------------------
+  3.1  C++（原生，最稳）
+--------------------------------------------------------------------------------
+
+  #include "HttpModule.h"
+  #include "Interfaces/IHttpRequest.h"
+  #include "Interfaces/IHttpResponse.h"
+  #include "Dom/JsonObject.h"
+  #include "Serialization/JsonSerializer.h"
+  #include "Serialization/JsonWriter.h"
+
+  void UMyAiClient::Ask(const FString& Prompt)
+  {
+      // 拼 JSON
+      TSharedPtr<FJsonObject> Root = MakeShareable(new FJsonObject);
+      Root->SetStringField(TEXT("model"), TEXT("deepseek-chat"));
+      Root->SetNumberField(TEXT("max_tokens"), 200);
+
+      TArray<TSharedPtr<FJsonValue>> Msgs;
+      {
+          TSharedPtr<FJsonObject> M = MakeShareable(new FJsonObject);
+          M->SetStringField(TEXT("role"), TEXT("system"));
+          M->SetStringField(TEXT("content"),
+              TEXT("回答必须只有一行，格式：YES|理由"));
+          Msgs.Add(MakeShareable(new FJsonValueObject(M)));
+      }
+      {
+          TSharedPtr<FJsonObject> M = MakeShareable(new FJsonObject);
+          M->SetStringField(TEXT("role"), TEXT("user"));
+          M->SetStringField(TEXT("content"), Prompt);
+          Msgs.Add(MakeShareable(new FJsonValueObject(M)));
+      }
+      Root->SetArrayField(TEXT("messages"), Msgs);
+
+      FString Body;
+      {
+          TSharedRef<TJsonWriter<>> W = TJsonWriterFactory<>::Create(&Body);
+          FJsonSerializer::Serialize(Root.ToSharedRef(), W);
+      }
+
+      // 发请求
+      TSharedRef<IHttpRequest> Req = FHttpModule::Get().CreateRequest();
+      Req->SetURL(TEXT("http://127.0.0.1:8787/v1/chat/completions"));
+      Req->SetVerb(TEXT("POST"));
+      Req->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+      Req->SetHeader(TEXT("Authorization"), TEXT("Bearer my-token-1"));
+      Req->SetContentAsString(Body);
+
+      Req->OnProcessRequestComplete().BindLambda(
+          [](FHttpRequestPtr, FHttpResponsePtr Resp, bool bOk)
+          {
+              if (!bOk || !Resp.IsValid()) return;
+
+              TSharedPtr<FJsonObject> Json;
+              TSharedRef<TJsonReader<>> R =
+                  TJsonReaderFactory<>::Create(Resp->GetContentAsString());
+
+              if (FJsonSerializer::Deserialize(R, Json) && Json.IsValid())
+              {
+                  const TArray<TSharedPtr<FJsonValue>>* Choices;
+                  if (Json->TryGetArrayField(TEXT("choices"), Choices) && Choices->Num() > 0)
+                  {
+                      TSharedPtr<FJsonObject> Msg =
+                          (*Choices)[0]->AsObject()->GetObjectField(TEXT("message"));
+                      FString Content = Msg->GetStringField(TEXT("content"));
+                      UE_LOG(LogTemp, Warning, TEXT("[AI] %s"), *Content);
+                  }
+              }
+          });
+
+      Req->ProcessRequest();
+  }
+
+  ★ 记得在 Build.cs 里加依赖：
+        PrivateDependencyModuleNames.AddRange(new string[] {
+            "HTTP", "Json", "JsonUtilities"
+        });
+
+--------------------------------------------------------------------------------
+  3.2  蓝图（Blueprint）
+--------------------------------------------------------------------------------
+
+  蓝图没有原生 HTTP 节点，需要装插件。常见选择：
+
+      VaRest       —— 最常用，免费，节点齐全
+      HttpBlueprint —— 也有
+      RuntimeHttp  —— 轻量
+
+  以 VaRest 为例，节点连法：
+
+      1. Construct Json Object
+            加字段 model   = "deepseek-chat"
+            加字段 messages（数组）
+              每个元素是一个 Json Object：
+                role    = "system" / "user"
+                content = 文本
+
+      2. Call URL
+            Verb    = POST
+            URL     = http://127.0.0.1:8787/v1/chat/completions
+            Headers = Content-Type: application/json
+                      Authorization: Bearer my-token-1
+            Body    = 上面构造的 Json Object
+
+      3. 绑定 On Request Complete / On Request Fail
+      4. 从返回的 Json 里取 choices[0].message.content
+
+  ★ VaRest 的 Get String Field 节点可以直接取字段，不用自己解析。
+
+
+================================================================================
+  四、寒霜引擎（Frostbite，战地系列等）
+================================================================================
+
+  寒霜引擎官方不开放服务端插件，能改的通常是：
+
+      Venice Unleashed (VU)   —— 战地3/4 的社区服务端，支持 Python/TypeScript
+      RCON + 外部程序          —— 通用兜底做法
+
+--------------------------------------------------------------------------------
+  4.1  Venice Unleashed —— Python
+--------------------------------------------------------------------------------
+
+  # VU 的 Python 环境里有 HTTP 能力
+  import json
+
+  def ask_ai(text):
+      import urllib.request
+
+      body = json.dumps({
+          "model": "deepseek-chat",
+          "messages": [
+              {"role": "system", "content": "回答必须只有一行，格式：YES|理由"},
+              {"role": "user",   "content": text},
+          ],
+          "max_tokens": 100,
+      }).encode("utf-8")
+
+      req = urllib.request.Request(
+          "http://127.0.0.1:8787/v1/chat/completions",
+          data=body,
+          method="POST",
+          headers={
+              "Content-Type": "application/json",
+              "Authorization": "Bearer my-token-1",
+          })
+
+      with urllib.request.urlopen(req, timeout=60) as r:
+          obj = json.loads(r.read().decode("utf-8"))
+          return obj["choices"][0]["message"]["content"]
+
+  # 在 VU 的事件里调用
+  # （VU 的异步模型注意：不要在会阻塞主循环的地方同步等，用线程或回调）
+
+--------------------------------------------------------------------------------
+  4.2  RCON + 外部程序（通用兜底，任何寒霜游戏都能用）
+--------------------------------------------------------------------------------
+
+  思路：
+      1. 写一个 Python 程序，用 RCON 连上服务器
+      2. 监听服务器事件 / 定时拉日志
+      3. 需要 AI 判断时调本代理
+      4. 用 RCON 命令执行结果（踢人、封禁、公告）
+
+  Python 代码见下面「九、通用」那节的 ask_ai()，
+  再配合各游戏的 RCON 库即可（如 bf2rcon、frostbite-rcon 等）。
+
+
+================================================================================
+  五、GMod（Garry's Mod）—— Lua
+================================================================================
+
+  GLua 自带 http 库，最简单。
+
+      local TOKEN = "my-token-1"
+
+      local function AskAI(userText, onDone)
+          local payload = util.TableToJSON({
+              model = "deepseek-chat",
+              messages = {
+                  { role = "system", content = "回答必须只有一行，格式：YES|理由" },
+                  { role = "user",   content = userText },
+              },
+              max_tokens = 100,
+          })
+
+          http.Post("http://127.0.0.1:8787/v1/chat/completions", payload, function(body, size, headers, code)
+              if code ~= 200 then
+                  print("[AI] 请求失败，HTTP " .. tostring(code))
+                  return
+              end
+
+              local obj = util.JSONToTable(body)
+              if not obj or not obj.choices then return end
+
+              local answer = obj.choices[1].message.content
+              if onDone then onDone(answer) end
+          end, {
+              ["Content-Type"]  = "application/json",
+              ["Authorization"] = "Bearer " .. TOKEN,
+          })
+      end
+
+      -- 用法
+      AskAI("这个玩家行为正常吗", function(ans)
+          print("[AI] " .. ans)
+      end)
+
+  ★ 注意：GMod 的服务端 http.Post 是异步的，回调在下一帧。
+  ★ 走 127.0.0.1 时 GMod 有些版本会拦，用服务器本机局域网 IP 也行。
+
+
+================================================================================
+  六、FiveM / RedM —— Lua
+================================================================================
+
+      local TOKEN = "my-token-1"
+
+      local function AskAI(userText, onDone)
+          local payload = json.encode({
+              model = "deepseek-chat",
+              messages = {
+                  { role = "system", content = "回答必须只有一行，格式：YES|理由" },
+                  { role = "user",   content = userText },
+              },
+              max_tokens = 100,
+          })
+
+          PerformHttpRequest(
+              "http://127.0.0.1:8787/v1/chat/completions",
+              function(code, body, headers)
+                  if code ~= 200 then
+                      print("[AI] 失败 HTTP " .. tostring(code))
+                      return
+                  end
+                  local obj = json.decode(body)
+                  if obj and obj.choices then
+                      onDone(obj.choices[1].message.content)
+                  end
+              end,
+              "POST",
+              payload,
+              {
+                  ["Content-Type"]  = "application/json",
+                  ["Authorization"] = "Bearer " .. TOKEN,
+              }
+          )
+      end
+
+
+================================================================================
+  七、Minecraft —— Java
+================================================================================
+
+--------------------------------------------------------------------------------
+  7.1  Forge / Fabric 模组（Java 11+）
+--------------------------------------------------------------------------------
+
+  import java.net.URI;
+  import java.net.http.HttpClient;
+  import java.net.http.HttpRequest;
+  import java.net.http.HttpResponse;
+  import java.time.Duration;
+
+  public final class AiClient {
+
+      private static final String URL   = "http://127.0.0.1:8787/v1/chat/completions";
+      private static final String TOKEN = "my-token-1";
+
+      private static final HttpClient HTTP = HttpClient.newBuilder()
+              .connectTimeout(Duration.ofSeconds(10))
+              .build();
+
+      /** 问一句，返回纯文本。失败返回 null。 */
+      public static String ask(String userText) {
+          String body = "{"
+              + "\"model\":\"deepseek-chat\","
+              + "\"messages\":["
+              +   "{\"role\":\"system\",\"content\":\"回答必须只有一行，格式：YES|理由\"},"
+              +   "{\"role\":\"user\",\"content\":" + json(userText) + "}"
+              + "],"
+              + "\"max_tokens\":100"
+              + "}";
+
+          HttpRequest req = HttpRequest.newBuilder()
+                  .uri(URI.create(URL))
+                  .timeout(Duration.ofSeconds(60))
+                  .header("Content-Type", "application/json")
+                  .header("Authorization", "Bearer " + TOKEN)
+                  .POST(HttpRequest.BodyPublishers.ofString(body))
+                  .build();
+
+          try {
+              HttpResponse<String> resp = HTTP.send(req, HttpResponse.BodyHandlers.ofString());
+              if (resp.statusCode() != 200) return null;
+              return extractContent(resp.body());
+          } catch (Exception e) {
+              return null;
+          }
+      }
+
+      /** 别在主线程里同步调用 —— 用线程池或 CompletableFuture。 */
+      public static void askAsync(String userText, java.util.function.Consumer<String> cb) {
+          java.util.concurrent.CompletableFuture
+              .supplyAsync(() -> ask(userText))
+              .thenAccept(cb);
+      }
+
+      private static String json(String s) {
+          StringBuilder sb = new StringBuilder("\"");
+          for (char c : s.toCharArray()) {
+              switch (c) {
+                  case '"':  sb.append("\\\""); break;
+                  case '\\': sb.append("\\\\"); break;
+                  case '\n': sb.append("\\n");  break;
+                  case '\r': sb.append("\\r");  break;
+                  case '\t': sb.append("\\t");  break;
+                  default:
+                      if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                      else sb.append(c);
+              }
+          }
+          return sb.append('"').toString();
+      }
+
+      private static String extractContent(String json) {
+          String key = "\"content\":";
+          int i = json.indexOf(key);
+          if (i < 0) return null;
+          i += key.length();
+          while (i < json.length() && json.charAt(i) == ' ') i++;
+          if (i >= json.length() || json.charAt(i) != '"') return null;
+          i++;
+
+          StringBuilder sb = new StringBuilder();
+          while (i < json.length()) {
+              char c = json.charAt(i);
+              if (c == '\\' && i + 1 < json.length()) {
+                  char n = json.charAt(++i);
+                  switch (n) {
+                      case 'n':  sb.append('\n'); break;
+                      case 'r':  sb.append('\r'); break;
+                      case 't':  sb.append('\t'); break;
+                      case '"':  sb.append('"');  break;
+                      case '\\': sb.append('\\'); break;
+                      case 'u':
+                          if (i + 4 < json.length()) {
+                              sb.append((char) Integer.parseInt(json.substring(i + 1, i + 5), 16));
+                              i += 4;
+                          }
+                          break;
+                      default: sb.append(n);
+                  }
+              } else if (c == '"') {
+                  break;
+              } else {
+                  sb.append(c);
+              }
+              i++;
+          }
+          return sb.toString();
+      }
+  }
+
+  ★ Bukkit / Spigot / Paper 插件也完全一样，把这个类拷过去直接能用。
+
+--------------------------------------------------------------------------------
+  7.2  Skript（不想写 Java 的话）
+--------------------------------------------------------------------------------
+
+  # Skript 有 fetch 之类的能力取决于版本，常见做法是调一个本地脚本：
+  # 让 Skript 执行命令，命令去调 Python，Python 调 AI，结果写文件，
+  # Skript 再读文件。绕，但最稳。
+
+  # 如果装的是 skript-reflect 或 SkBee，可以直接发 HTTP：
+
+  on load:
+      set {_body} to "{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+
+  # SkBee 的示例（版本不同语法略有差异，查你装的那版文档）
+
+
+================================================================================
+  八、其他引擎
+================================================================================
+
+--------------------------------------------------------------------------------
+  8.1  Godot —— GDScript
+--------------------------------------------------------------------------------
+
+  extends Node
+
+  const URL   = "http://127.0.0.1:8787/v1/chat/completions"
+  const TOKEN = "my-token-1"
+
+  func ask_ai(user_text: String) -> void:
+      var payload := {
+          "model": "deepseek-chat",
+          "messages": [
+              {"role": "system", "content": "回答必须只有一行，格式：YES|理由"},
+              {"role": "user",   "content": user_text},
+          ],
+          "max_tokens": 100,
+      }
+
+      var req := HTTPRequest.new()
+      add_child(req)
+      req.request_completed.connect(_on_done)
+
+      var headers := [
+          "Content-Type: application/json",
+          "Authorization: Bearer " + TOKEN,
+      ]
+      req.request(URL, headers, HTTPClient.METHOD_POST, JSON.stringify(payload))
+
+  func _on_done(result: int, code: int, headers: PackedStringArray, body: PackedByteArray) -> void:
+      if code != 200:
+          print("[AI] 失败 HTTP ", code)
+          return
+      var obj = JSON.parse_string(body.get_string_from_utf8())
+      if obj and obj.has("choices"):
+          print("[AI] ", obj["choices"][0]["message"]["content"])
+
+  ★ 也可以用 C# 版 Godot，直接抄上面 Unity 那节的代码。
+
+--------------------------------------------------------------------------------
+  8.2  CryEngine —— Lua
+--------------------------------------------------------------------------------
+
+  -- CryEngine 的 Lua 有 Network / System 模块，不同版本 API 不同。
+  -- 稳妥做法是用外部程序（见下面 Python 那节），
+  -- 或者用 CryEngine 的 HTTP 扩展（部分项目自带）。
+
+  -- 如果是 Star Citizen 那类自研分支，直接看引擎文档里的 HTTP 模块，
+  -- 请求体格式和本文档开头「接口契约」完全一致。
+
+--------------------------------------------------------------------------------
+  8.3  GameMaker —— GML
+--------------------------------------------------------------------------------
+
+  // GameMaker 没有内建 HTTP。
+  // 用扩展：http_request（Marketplace / GitHub 上都有）
+  // 或者用 async_load 配合 http_get / http_post_string（部分版本有）
+
+  // 新版 GameMaker 有：
+  var _body = @'
+  {"model":"deepseek-chat","messages":[{"role":"user","content":"hi"}]}
+  '@;
+
+  var _req = http_request("http://127.0.0.1:8787/v1/chat/completions");
+  http_set_request_header(_req, "Content-Type", "application/json");
+  http_set_request_header(_req, "Authorization", "Bearer my-token-1");
+  http_set_request_body(_req, _body);
+  http_send_request(_req);
+
+  // 在 Async - HTTP 事件里处理返回
+
+--------------------------------------------------------------------------------
+  8.4  GoldSource（半条命1、CS1.6）—— AMX Mod X
+--------------------------------------------------------------------------------
+
+  // AMX Mod X 的 Pawn 需要 curl 模块或 sockets 模块
+
+  #include <amxmodx>
+  #include <curl>
+
+  public ask_ai(const text[])
+  {
+      new body[1024];
+      formatex(body, charsmax(body),
+          "{\"model\":\"deepseek-chat\",\"messages\":["
+          "{\"role\":\"user\",\"content\":\"%s\"}],\"max_tokens\":100}", text);
+
+      new curl = curl_easy_init();
+      curl_easy_setopt(curl, CURLOPT_URL, "http://127.0.0.1:8787/v1/chat/completions");
+      // ... 加头、发请求
+  }
+
+--------------------------------------------------------------------------------
+  8.5  RimWorld / 其他 Unity 单机 —— C#
+--------------------------------------------------------------------------------
+
+  直接用上面「一、Unity」那节的代码，一模一样。
+  唯一区别：RimWorld 要用它自己的协程调度，别在主线程同步等。
+
+--------------------------------------------------------------------------------
+  8.6  Python 类游戏（多数模拟经营 / 自研服务端）
+--------------------------------------------------------------------------------
+
+  直接抄下面「九、通用」的代码。
+
+
+================================================================================
+  九、通用：任何语言的最小可用代码
+================================================================================
+
+--------------------------------------------------------------------------------
+  9.1  Python（标准库，零依赖）
+--------------------------------------------------------------------------------
+
+  import json
+  import urllib.request
+
+  def ask_ai(user_text, system="回答必须只有一行，格式：YES|理由"):
+      body = json.dumps({
+          "model": "deepseek-chat",
+          "messages": [
+              {"role": "system", "content": system},
+              {"role": "user",   "content": user_text},
+          ],
+          "max_tokens": 100,
+          "temperature": 0.2,
+      }).encode("utf-8")
+
+      req = urllib.request.Request(
+          "http://127.0.0.1:8787/v1/chat/completions",
+          data=body, method="POST",
+          headers={
+              "Content-Type": "application/json",
+              "Authorization": "Bearer my-token-1",
+          })
+
+      try:
+          with urllib.request.urlopen(req, timeout=60) as r:
+              obj = json.loads(r.read().decode("utf-8"))
+              return obj["choices"][0]["message"]["content"]
+      except Exception as e:
+          print("[AI] 请求失败:", e)
+          return None
+
+
+  if __name__ == "__main__":
+      print(ask_ai("今天天气怎么样"))
+
+--------------------------------------------------------------------------------
+  9.2  Node.js / JavaScript
+--------------------------------------------------------------------------------
+
+  const URL = "http://127.0.0.1:8787/v1/chat/completions";
+  const TOKEN = "my-token-1";
+
+  async function askAi(userText) {
+      const resp = await fetch(URL, {
+          method: "POST",
+          headers: {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer " + TOKEN,
+          },
+          body: JSON.stringify({
+              model: "deepseek-chat",
+              messages: [
+                  { role: "system", content: "回答必须只有一行，格式：YES|理由" },
+                  { role: "user",   content: userText },
+              ],
+              max_tokens: 100,
+          }),
+      });
+
+      if (!resp.ok) {
+          console.error("[AI] HTTP", resp.status);
+          return null;
+      }
+      const obj = await resp.json();
+      return obj.choices[0].message.content;
+  }
+
+  askAi("今天天气怎么样").then(console.log);
+
+  ★ 浏览器里也能跑（代理已开 CORS）。
+
+--------------------------------------------------------------------------------
+  9.3  curl（命令行验证用）
+--------------------------------------------------------------------------------
+
+  curl -X POST http://127.0.0.1:8787/v1/chat/completions ^
+       -H "Content-Type: application/json" ^
+       -H "Authorization: Bearer my-token-1" ^
+       -d "{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"你好\"}],\"max_tokens\":50}"
+
+  ★ 这条命令能通，说明接口是好的，问题就在你那边的插件代码。
+    排查顺序永远是这个：先 curl 通，再调插件。
+
+--------------------------------------------------------------------------------
+  9.4  C（任何能调 WinHTTP / libcurl 的语言都行）
+--------------------------------------------------------------------------------
+
+  思路：libcurl 或 WinHTTP 发 POST，把响应当字符串处理。
+  请求体和响应格式与本文档开头完全一致，没有特殊之处。
+
+
+================================================================================
+  十、排查顺序（照这个走，99% 的问题都能定位）
+================================================================================
+
+  第 1 步：接口本身活着吗
+
+      curl http://127.0.0.1:8787/health
+
+      返回 {"ok": true, ...} 就是活的。
+      连不上 → 代理没启动，或端口被占。
+
+  第 2 步：模型列表能拿到吗
+
+      curl http://127.0.0.1:8787/v1/models
+
+      这一步是给「插件启动时探测模型」用的。
+      如果你的插件启动就报错，八成是这个接口没通。
+
+  第 3 步：带令牌能请求通吗
+
+      用 9.3 那条 curl。
+      返回 401 → 令牌填错了（要填 AI_TOKENS 里的，不是真 Key）。
+      返回 429 → 触发限流了，把 AI_RATE_PER_MIN 调大。
+      返回 500 → AI_API_KEY 没填。
+      返回 502 → 上游连不上（检查 AI_UPSTREAMS 和网络）。
+
+  第 4 步：插件里还是不行？
+
+      - 看服务端黑窗口有没有日志（代理会打印每次请求）
+      - 确认插件里的 api_base_url 结尾有没有 /v1
+      - 确认请求头带的是 Bearer（不是别的写法）
+      - 有些引擎对 127.0.0.1 有限制，试试本机局域网 IP
+
+  第 5 步：看用量
+
+      curl -H "Authorization: Bearer <AI_ADMIN_TOKEN>" http://127.0.0.1:8787/stats
+
+      能看到每个令牌用了多少次、多少 token。
+      请求数是 0 → 插件根本没发出来（是插件那边的问题，不是接口）。
+
+
+================================================================================
+  附：各引擎能用的最小实现一览
+================================================================================
+
+  引擎 / 框架            语言            需要额外东西吗
+  ────────────────────────────────────────────────────────────────────────
+  Unity / BepInEx        C#              不需要（System.Net.Http）
+  Unity / MelonLoader    C#              不需要
+  Unity / 单机模组       C#              不需要
+  起源引擎 / SourceMod   SourcePawn      需要 SourceMod 1.11+ 或 SteamWorks
+  起源引擎 / Lua         Lua             需要 luasocket
+  GMod                   Lua             不需要（自带 http）
+  FiveM / RedM           Lua             不需要（自带 PerformHttpRequest）
+  虚幻引擎               C++             不需要（HTTP 模块）
+  虚幻引擎 / 蓝图        蓝图            需要 VaRest 等插件
+  寒霜 / VU              Python          不需要
+  寒霜 / 其他            RCON + 外部程序  需要写个外部程序
+  Minecraft / 模组       Java 11+        不需要（java.net.http）
+  Minecraft / 服务端插件 Java 11+        不需要
+  Godot                  GDScript        不需要（HTTPRequest 节点）
+  Godot                  C#              不需要
+  CryEngine              Lua             看具体版本，可能要外部程序
+  GameMaker              GML             需要 HTTP 扩展
+  GoldSource / AMX       Pawn            需要 curl 或 sockets 模块
+  RimWorld               C#              不需要
+  Web / Node             JavaScript      不需要（fetch，且已开 CORS）
+
+
+--------------------------------------------------------------------------------
+  作者：AWA　　本插件全由 DSH 开发
+--------------------------------------------------------------------------------

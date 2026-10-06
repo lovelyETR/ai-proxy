@@ -1,0 +1,24 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 运行时产物（含真 Key，绝对不能提交）──
+config.json
+!config.example.json
+log/
+logs/
+*.log
+requests.log
+
+# ── IDE ──
+.idea/
+.vscode/
+*.swp
+
+# ── 系统 ──
+Thumbs.db
+Desktop.ini
+.DS_Store

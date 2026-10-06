@@ -1,0 +1,26 @@
+{
+  "_说明": "配置模板。复制成 config.json 再改。环境变量优先级更高。",
+
+  "api_key": "",
+  "tokens": "my-token-1:我的服务器",
+
+  "host": "127.0.0.1",
+  "port": 8787,
+
+  "_上游_说明": "可以配多个，用逗号分隔。一个挂了自动换下一个。",
+  "upstreams": "https://api.deepseek.com",
+
+  "_模型_说明": "留空则透传调用方指定的模型；填了就强制用这个。",
+  "model": "",
+
+  "_对外模型表_说明": "插件探测 /v1/models 时返回的名字列表。",
+  "expose_models": "deepseek-chat,deepseek-reasoner",
+
+  "rate_per_min": 30,
+  "daily_quota": 500,
+  "timeout": 60,
+  "retry": 2,
+
+  "admin_token": "local-admin",
+  "log": "log/requests.log"
+}
