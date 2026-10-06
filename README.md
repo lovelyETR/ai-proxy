@@ -86,7 +86,7 @@ api_key: 'my-token-1'          # 令牌，不是真 Key
 
 因为它就是 OpenAI 兼容接口，所以**不需要改插件代码**。
 
-### 配合 AWA-DeepSeek-AntiCheat 用
+### 配置改法
 
 ```yaml
 # 原来（直连官方，配置里存真 Key）
