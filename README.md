@@ -144,14 +144,12 @@ api_key: 'my-token-1'
 只要对方是 OpenAI 兼容接口，改两个变量就行：
 
 ```bat
-rem 本地 Ollama
-set AI_UPSTREAMS=http://127.0.0.1:11434/v1
-set AI_MODEL=qwen2.5:7b-instruct
-
-rem LM Studio
-set AI_UPSTREAMS=http://127.0.0.1:1234/v1
-set AI_MODEL=<你在 LM Studio 里加载的模型名>
+set AI_UPSTREAMS=<服务地址>/v1
+set AI_MODEL=<模型名>
 ```
+
+服务地址和模型名填那个服务文档里给的即可。
+地址末尾记得带 `/v1`。
 
 ---
 
